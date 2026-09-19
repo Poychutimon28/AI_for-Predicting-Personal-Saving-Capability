@@ -207,57 +207,105 @@ TAB_OTHER = "🗂️ อื่นๆ"
 
 
 # ----------------------------------------------------------------------------
-# จัดกลุ่ม attribute ของโมเดลเข้ากับแท็บ (ใช้ FIELD_META ถ้ารู้จัก มิฉะนั้น
-# fallback ไปแท็บ "อื่นๆ" โดยอัตโนมัติ เพื่อไม่ให้แอป error ถ้าโมเดลมี
-# คอลัมน์ที่ไม่ได้อยู่ใน FIELD_META)
+# ตรวจจับกลุ่มคอลัมน์ one-hot (ชื่อรูปแบบ "prefix=value") แล้วรวมกลับเป็น
+# ฟิลด์เดียว (dropdown) อัตโนมัติ — จำเป็นเพราะบางโมเดล (เช่น Logistic
+# Regression, Neural Network) ผ่านการ Continuize ใน Orange มาก่อนฝึก ทำให้
+# ตัวแปรหมวดหมู่ถูกแตกเป็นคอลัมน์ 0/1 แยกทีละค่า (เช่น financial_scenario
+# =inflation, financial_scenario=normal, ...) ในขณะที่บางโมเดล (เช่น Tree)
+# อาจเก็บเป็นตัวแปรหมวดหมู่ปกติ (DiscreteVariable) ไม่ผ่าน Continuize เลย
+# โค้ดส่วนนี้ทำให้ทั้งสองแบบแสดงผลเป็น dropdown เดียวกันเสมอ ไม่ว่าจะโหลด
+# โมเดลไหนก็ตาม
 # ----------------------------------------------------------------------------
-attrs_by_tab = {t: [] for t in TAB_ORDER}
-attrs_by_tab[TAB_OTHER] = []
-for attr in domain.attributes:
-    meta = FIELD_META.get(attr.name)
-    tab_name = meta["tab"] if meta else TAB_OTHER
-    attrs_by_tab.setdefault(tab_name, []).append(attr)
+onehot_groups = {}   # prefix -> list of (value_str, attr)
+normal_attrs = []     # attribute ที่ไม่ใช่ one-hot group (เป็นตัวแปรเดี่ยว)
 
-active_tabs = [t for t in TAB_ORDER + [TAB_OTHER] if attrs_by_tab.get(t)]
+for attr in domain.attributes:
+    if "=" in attr.name and isinstance(attr, ContinuousVariable):
+        prefix, _, value_str = attr.name.partition("=")
+        onehot_groups.setdefault(prefix, []).append((value_str, attr))
+    else:
+        normal_attrs.append(attr)
+
+# "field" คือหน่วยที่จะวาดเป็น 1 ช่องกรอกบนหน้าจอ อาจเป็น attribute เดี่ยว
+# หรือกลุ่ม one-hot ก็ได้ เก็บเป็น tuple ("single", attr) หรือ
+# ("onehot", prefix, [(value,attr),...])
+fields = [("single", a) for a in normal_attrs]
+for prefix, items in onehot_groups.items():
+    fields.append(("onehot", prefix, items))
+
+
+# ----------------------------------------------------------------------------
+# จัดกลุ่ม field เข้ากับแท็บ (ใช้ FIELD_META ถ้ารู้จัก มิฉะนั้น fallback
+# ไปแท็บ "อื่นๆ" โดยอัตโนมัติ เพื่อไม่ให้แอป error ถ้าโมเดลมีคอลัมน์ที่ไม่ได้
+# อยู่ใน FIELD_META)
+# ----------------------------------------------------------------------------
+fields_by_tab = {t: [] for t in TAB_ORDER}
+fields_by_tab[TAB_OTHER] = []
+for field in fields:
+    lookup_name = field[1].name if field[0] == "single" else field[1]
+    meta = FIELD_META.get(lookup_name)
+    tab_name = meta["tab"] if meta else TAB_OTHER
+    fields_by_tab.setdefault(tab_name, []).append(field)
+
+active_tabs = [t for t in TAB_ORDER + [TAB_OTHER] if fields_by_tab.get(t)]
 
 
 st.subheader("📝 กรอกข้อมูลทางการเงินของคุณ")
-user_values = {}  # key = ชื่อ attribute (ภาษาอังกฤษตามโมเดล), value = float
+user_values = {}  # key = ชื่อ attribute จริงตาม domain, value = float
 
 tabs = st.tabs(active_tabs)
 for tab_name, tab_container in zip(active_tabs, tabs):
     with tab_container:
-        attrs = attrs_by_tab[tab_name]
+        tab_fields = fields_by_tab[tab_name]
         # จัดเรียงเป็น 2 คอลัมน์ให้ดูเป็นระเบียบ
         cols = st.columns(2)
-        for i, attr in enumerate(attrs):
+        for i, field in enumerate(tab_fields):
             col = cols[i % 2]
-            meta = FIELD_META.get(attr.name, {})
             with col:
-                if isinstance(attr, ContinuousVariable):
-                    label = meta.get("label", attr.name)
-                    default_val = float(meta.get("default", 0.0))
-                    step = float(meta.get("step", 1.0))
-                    fmt = meta.get("format", "%.2f")
-                    val = st.number_input(
-                        label, value=default_val, step=step, format=fmt,
-                        key=f"num_{attr.name}",
-                    )
-                    user_values[attr.name] = float(val)
+                if field[0] == "single":
+                    attr = field[1]
+                    meta = FIELD_META.get(attr.name, {})
 
-                elif isinstance(attr, DiscreteVariable):
-                    label = meta.get("label", attr.name)
-                    thai_options = meta.get("thai_options", {})
-                    options = list(attr.values)
-                    selected_label = st.selectbox(
-                        label, options=options,
-                        format_func=lambda v: thai_options.get(v, v),
-                        key=f"sel_{attr.name}",
-                    )
-                    user_values[attr.name] = float(attr.values.index(selected_label))
+                    if isinstance(attr, ContinuousVariable):
+                        label = meta.get("label", attr.name)
+                        default_val = float(meta.get("default", 0.0))
+                        step = float(meta.get("step", 1.0))
+                        fmt = meta.get("format", "%.2f")
+                        val = st.number_input(
+                            label, value=default_val, step=step, format=fmt,
+                            key=f"num_{attr.name}",
+                        )
+                        user_values[attr.name] = float(val)
+
+                    elif isinstance(attr, DiscreteVariable):
+                        label = meta.get("label", attr.name)
+                        thai_options = meta.get("thai_options", {})
+                        options = list(attr.values)
+                        selected_label = st.selectbox(
+                            label, options=options,
+                            format_func=lambda v, m=thai_options: m.get(v, v),
+                            key=f"sel_{attr.name}",
+                        )
+                        user_values[attr.name] = float(attr.values.index(selected_label))
+
+                    else:
+                        st.warning(f"ไม่รองรับชนิดตัวแปร '{attr.name}' โดยอัตโนมัติ")
 
                 else:
-                    st.warning(f"ไม่รองรับชนิดตัวแปร '{attr.name}' โดยอัตโนมัติ")
+                    # ----- กลุ่ม one-hot: รวมกลับเป็น dropdown เดียว -----
+                    _, prefix, items = field
+                    meta = FIELD_META.get(prefix, {})
+                    label = meta.get("label", prefix)
+                    thai_options = meta.get("thai_options", {})
+                    value_strs = [v for v, _ in items]
+                    selected_value = st.selectbox(
+                        label, options=value_strs,
+                        format_func=lambda v, m=thai_options: m.get(v, v),
+                        key=f"onehot_{prefix}",
+                    )
+                    # ตั้งค่าคอลัมน์ที่เลือกเป็น 1.0 ส่วนคอลัมน์อื่นในกลุ่มเดียวกันเป็น 0.0
+                    for value_str, attr in items:
+                        user_values[attr.name] = 1.0 if value_str == selected_value else 0.0
 
 
 # ----------------------------------------------------------------------------
@@ -265,16 +313,29 @@ for tab_name, tab_container in zip(active_tabs, tabs):
 # ----------------------------------------------------------------------------
 with st.expander("📋 สรุปข้อมูลที่คุณกรอก (คลิกเพื่อตรวจสอบ)"):
     summary_rows = {}
-    for attr in domain.attributes:
-        meta = FIELD_META.get(attr.name, {})
-        label = meta.get("label", attr.name)
-        if isinstance(attr, DiscreteVariable):
-            idx = int(user_values[attr.name])
-            raw_val = attr.values[idx]
-            thai_options = meta.get("thai_options", {})
-            summary_rows[label] = thai_options.get(raw_val, raw_val)
+    for field in fields:
+        if field[0] == "single":
+            attr = field[1]
+            meta = FIELD_META.get(attr.name, {})
+            label = meta.get("label", attr.name)
+            if isinstance(attr, DiscreteVariable):
+                idx = int(user_values[attr.name])
+                raw_val = attr.values[idx]
+                thai_options = meta.get("thai_options", {})
+                summary_rows[label] = thai_options.get(raw_val, raw_val)
+            else:
+                summary_rows[label] = f"{user_values[attr.name]:,.2f}"
         else:
-            summary_rows[label] = f"{user_values[attr.name]:,.2f}"
+            # กลุ่ม one-hot: หาว่าค่าไหนถูกเลือกอยู่ (เท่ากับ 1.0) แล้วแสดง
+            # เป็นค่าเดียวเหมือนตอนกรอก ไม่แสดงแยกทีละคอลัมน์
+            _, prefix, items = field
+            meta = FIELD_META.get(prefix, {})
+            label = meta.get("label", prefix)
+            thai_options = meta.get("thai_options", {})
+            selected_value = next(
+                (v for v, a in items if user_values.get(a.name) == 1.0), None
+            )
+            summary_rows[label] = thai_options.get(selected_value, selected_value)
     st.table(summary_rows)
 
 
