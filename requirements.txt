@@ -1,0 +1,22 @@
+# requirements.txt
+# ไลบรารีที่จำเป็นสำหรับรันเว็บแอป app.py
+#
+# หมายเหตุ: ระบุแค่ไลบรารีหลักที่แอปเรียกใช้ตรง ๆ (ไม่ปักหมุดเวอร์ชันตายตัว
+# ทุกตัว) แล้วปล่อยให้ pip เลือกเวอร์ชันที่เข้ากันได้ทั้งหมดให้เองโดย
+# อัตโนมัติ เพราะ Orange3 มีข้อกำหนดเวอร์ชันของ scikit-learn/numpy/pandas
+# ผูกติดกันอยู่แล้วภายใน การปักหมุดเองอาจทำให้ pip resolve ไม่ได้
+
+streamlit>=1.38.0
+joblib>=1.3.0
+
+# โมเดล .pkcls ทั้ง 3 ไฟล์ถูกฝึกด้วยโปรแกรม Orange Data Mining จึงต้องใช้
+# Orange3 ในการโหลดโมเดล มิฉะนั้นจะเจอ ModuleNotFoundError: No module
+# named 'Orange'
+Orange3
+
+# Orange3 เรียกใช้ pkg_resources (มากับ setuptools) ตอน import เพื่อจัดการ
+# ระบบ add-on ของมัน แต่ setuptools ตั้งแต่เวอร์ชัน 82.0.0 เป็นต้นไป ได้ลบ
+# โมดูล pkg_resources ออกไปแล้วอย่างสมบูรณ์ จึงต้องปักเพดานเวอร์ชันไว้ที่
+# <81 เพื่อให้ยังมี pkg_resources ใช้งานได้ มิฉะนั้นจะเจอ
+# ModuleNotFoundError: No module named 'pkg_resources'
+setuptools<81
