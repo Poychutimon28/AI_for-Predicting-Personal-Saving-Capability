@@ -205,6 +205,21 @@ FIELD_META = {
 TAB_ORDER = [TAB_INCOME_EXPENSE, TAB_DEBT_CREDIT, TAB_STATUS_OTHER]
 TAB_OTHER = "🗂️ อื่นๆ"
 
+# ----------------------------------------------------------------------------
+# ฟิลด์ที่ต้องการ "ซ่อน" ไม่ให้ผู้ใช้กรอกในหน้าเว็บ แต่จะใส่ค่า default ให้
+# อัตโนมัติตอนเตรียมข้อมูลส่งเข้าโมเดลแทน
+# key = ชื่อ attribute เดี่ยว หรือ prefix ของกลุ่ม one-hot (ส่วนก่อน "=")
+# value = ค่า default ที่ต้องการ (เป็น string ตรงกับ attr.values หรือ
+#         ชื่อ value_str ในกลุ่ม one-hot เช่น "0")
+#
+# *** จุดที่ต้องแก้ถ้าต้องการซ่อน/ตั้งค่า default ฟิลด์อื่นเพิ่มเติม ***
+# เพิ่ม key-value ในดิกชันนารีนี้ได้เลย โดย key ต้องตรงกับชื่อ attribute จริง
+# (หรือ prefix ก่อน "=" ถ้าเป็นกลุ่ม one-hot)
+# ----------------------------------------------------------------------------
+HIDDEN_FIELD_DEFAULTS = {
+    "fraud_flag": "0",  # ไม่ให้ผู้ใช้กรอก ตั้งค่า default = "ไม่พบสัญญาณผิดปกติ" (0) ให้เสมอ
+}
+
 
 # ----------------------------------------------------------------------------
 # ตรวจจับกลุ่มคอลัมน์ one-hot (ชื่อรูปแบบ "prefix=value") แล้วรวมกลับเป็น
@@ -218,12 +233,19 @@ TAB_OTHER = "🗂️ อื่นๆ"
 # ----------------------------------------------------------------------------
 onehot_groups = {}   # prefix -> list of (value_str, attr)
 normal_attrs = []     # attribute ที่ไม่ใช่ one-hot group (เป็นตัวแปรเดี่ยว)
+hidden_attrs = []     # เก็บ attribute ที่ถูกซ่อนไว้ (ไม่แสดงในฟอร์ม) พร้อม default
 
 for attr in domain.attributes:
     if "=" in attr.name and isinstance(attr, ContinuousVariable):
         prefix, _, value_str = attr.name.partition("=")
+        if prefix in HIDDEN_FIELD_DEFAULTS:
+            hidden_attrs.append(attr)
+            continue
         onehot_groups.setdefault(prefix, []).append((value_str, attr))
     else:
+        if attr.name in HIDDEN_FIELD_DEFAULTS:
+            hidden_attrs.append(attr)
+            continue
         normal_attrs.append(attr)
 
 # "field" คือหน่วยที่จะวาดเป็น 1 ช่องกรอกบนหน้าจอ อาจเป็น attribute เดี่ยว
@@ -306,6 +328,26 @@ for tab_name, tab_container in zip(active_tabs, tabs):
                     # ตั้งค่าคอลัมน์ที่เลือกเป็น 1.0 ส่วนคอลัมน์อื่นในกลุ่มเดียวกันเป็น 0.0
                     for value_str, attr in items:
                         user_values[attr.name] = 1.0 if value_str == selected_value else 0.0
+
+
+# ----------------------------------------------------------------------------
+# เติมค่า default ให้ฟิลด์ที่ถูกซ่อนไว้ (ไม่แสดงในฟอร์ม) โดยอัตโนมัติ
+# เช่น fraud_flag = "0" เสมอ ตามที่กำหนดไว้ใน HIDDEN_FIELD_DEFAULTS
+# ----------------------------------------------------------------------------
+for attr in hidden_attrs:
+    if "=" in attr.name:
+        # เป็นคอลัมน์ในกลุ่ม one-hot (เช่น fraud_flag=0, fraud_flag=1)
+        prefix, _, value_str = attr.name.partition("=")
+        default_val = HIDDEN_FIELD_DEFAULTS.get(prefix)
+        user_values[attr.name] = 1.0 if value_str == default_val else 0.0
+    elif isinstance(attr, DiscreteVariable):
+        default_val = HIDDEN_FIELD_DEFAULTS.get(attr.name)
+        idx = attr.values.index(default_val) if default_val in attr.values else 0
+        user_values[attr.name] = float(idx)
+    else:
+        # ContinuousVariable ที่ถูกซ่อน (เผื่อกรณีอื่นในอนาคต)
+        default_val = HIDDEN_FIELD_DEFAULTS.get(attr.name, 0)
+        user_values[attr.name] = float(default_val)
 
 
 # ----------------------------------------------------------------------------
