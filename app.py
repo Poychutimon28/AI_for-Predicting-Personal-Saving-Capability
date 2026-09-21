@@ -33,6 +33,117 @@ except Exception as e:
 
 
 # ----------------------------------------------------------------------------
+# ตั้งค่าสกุลเงิน : ทั้งแอปแสดงและรับค่าเป็น "บาท (THB / ฿)"
+#
+# THB_PER_MODEL_UNIT = อัตราแปลง "บาท -> หน่วยเงินของข้อมูลที่ใช้ฝึกโมเดล"
+#   ค่าที่ส่งเข้าโมเดล = จำนวนเงินบาทที่ผู้ใช้กรอก / THB_PER_MODEL_UNIT
+#
+#   - 1.0  = ไม่แปลง (ข้อมูลที่ใช้ฝึกอยู่ในสเกลเดียวกับบาท)  <-- ค่าเริ่มต้น
+#   - เช่น 35.0 = ข้อมูลที่ใช้ฝึกเป็นดอลลาร์ และ 1 ดอลลาร์ ≈ 35 บาท
+#
+# *** โมเดลไวต่อสเกลของตัวเลข (โดยเฉพาะ Logistic Regression / Neural Network)
+# ตรวจสเกลของข้อมูลเทรนได้จาก Orange (Data Info / Feature Statistics ของ
+# monthly_income) แล้วตั้งค่าตรงนี้ให้ตรง (หรือปรับชั่วคราวในแถบ "ตั้งค่าขั้นสูง"
+# ด้านซ้ายของเว็บ) ***
+# ----------------------------------------------------------------------------
+CURRENCY_NAME = "บาท"
+CURRENCY_SYMBOL = "฿"
+CURRENCY_CODE = "THB"
+THB_PER_MODEL_UNIT = 1.0
+MONEY_HELP = f"หน่วย: {CURRENCY_NAME} ({CURRENCY_CODE} / {CURRENCY_SYMBOL})"
+
+# ช่วงคะแนนเครดิตที่ถือว่าเป็นไปได้ (ใช้ตรวจสอบก่อนทำนาย)
+CREDIT_SCORE_MIN, CREDIT_SCORE_MAX = 300, 850
+
+
+# ----------------------------------------------------------------------------
+# ฟังก์ชันช่วยเหลือ (ไม่ผูกกับ Streamlit เพื่อให้ทดสอบแยกได้)
+# ----------------------------------------------------------------------------
+def fmt_baht(x, decimals=2):
+    """จัดรูปแบบจำนวนเงินเป็นบาท เช่น ฿25,000.00"""
+    return f"{CURRENCY_SYMBOL}{x:,.{decimals}f}"
+
+
+def ordered_options(available, thai_options):
+    """เรียงตัวเลือกตามลำดับใน thai_options (ตัวแรก = ค่าเริ่มต้น) ค่าที่ไม่รู้จักต่อท้าย"""
+    known = [k for k in thai_options if k in available]
+    extra = [v for v in available if v not in thai_options]
+    return known + extra
+
+
+def validate_inputs(values, raw):
+    """
+    ตรวจความสอดคล้องของข้อมูลก่อนส่งเข้าโมเดล
+    คืนค่า (errors, warnings)  errors = ต้องแก้ก่อนทำนาย / warnings = เตือนแต่ทำนายต่อได้
+    """
+    errors, warns = [], []
+    income = values.get("monthly_income")
+    expense = values.get("monthly_expense_total")
+
+    if income is not None and income <= 0:
+        errors.append(f"กรุณากรอก 'รายได้ต่อเดือน' ให้มากกว่า 0 {CURRENCY_NAME}")
+
+    score = values.get("credit_score")
+    if score is not None and not (CREDIT_SCORE_MIN <= score <= CREDIT_SCORE_MAX):
+        errors.append(
+            f"คะแนนเครดิตควรอยู่ในช่วง {CREDIT_SCORE_MIN}-{CREDIT_SCORE_MAX} "
+            f"(ตอนนี้กรอก {score:,.0f})"
+        )
+
+    if income is not None and income > 0 and expense is not None:
+        if expense <= 0:
+            warns.append(f"รายจ่ายรวมต่อเดือนเป็น 0 {CURRENCY_NAME} — โปรดตรวจสอบว่ากรอกครบหรือยัง")
+
+        flow = raw.get("cash_flow_status")
+        if flow == "Positive" and expense > income:
+            warns.append("เลือกกระแสเงินสด 'เป็นบวก' แต่รายจ่ายรวมมากกว่ารายได้ — ข้อมูลอาจขัดแย้งกัน")
+        if flow == "Negative" and expense < income:
+            warns.append("เลือกกระแสเงินสด 'ติดลบ' แต่รายได้มากกว่ารายจ่ายรวม — ข้อมูลอาจขัดแย้งกัน")
+
+        essential = values.get("essential_spending")
+        discretionary = values.get("discretionary_spending")
+        if essential is not None and discretionary is not None and expense > 0:
+            if essential + discretionary > expense * 1.001:
+                warns.append(
+                    "รายจ่ายจำเป็น + รายจ่ายฟุ่มเฟือย มากกว่ารายจ่ายรวมต่อเดือน — โปรดตรวจสอบตัวเลข"
+                )
+
+        loan = values.get("loan_payment")
+        dti = values.get("debt_to_income_ratio")
+        if loan is not None and dti is not None:
+            calc = loan / income
+            if abs(calc - dti) > 0.10:
+                warns.append(
+                    f"DTI ที่เลือก ({dti:.2f}) ต่างจากยอดผ่อนชำระ ÷ รายได้ที่คำนวณได้ ({calc:.2f}) "
+                    "— ตรวจสอบว่าสองค่านี้สอดคล้องกันหรือไม่"
+                )
+    return errors, warns
+
+
+def build_model_row(attrs, values, money_names, thb_per_unit):
+    """
+    สร้างแถวข้อมูลตามลำดับคอลัมน์ของ domain โมเดล
+    - ยอดเงิน (บาท) จะถูกแปลงเป็นหน่วยของข้อมูลเทรนด้วย thb_per_unit
+    - คอลัมน์อื่น (สัดส่วน, คะแนน, one-hot, หมวดหมู่) ส่งค่าตามเดิม ไม่แปลง
+    """
+    missing = [a.name for a in attrs if a.name not in values]
+    if missing:
+        raise ValueError("ไม่มีค่าสำหรับคอลัมน์ของโมเดล: " + ", ".join(missing))
+    if thb_per_unit <= 0:
+        raise ValueError("อัตราแปลงสกุลเงินต้องมากกว่า 0")
+
+    row = []
+    for a in attrs:
+        v = float(values[a.name])
+        if a.name in money_names:
+            v = v / thb_per_unit
+        row.append(v)
+    if not np.all(np.isfinite(row)):
+        raise ValueError("พบค่าที่ไม่ใช่ตัวเลขในข้อมูลที่ส่งให้โมเดล")
+    return row
+
+
+# ----------------------------------------------------------------------------
 # ตั้งค่าหน้าเว็บ + หัวข้อ
 # ----------------------------------------------------------------------------
 st.set_page_config(
@@ -42,7 +153,7 @@ st.set_page_config(
 )
 st.title("💰 โปรแกรม AI ทำนายความสามารถในการออมเงิน")
 st.caption(
-    "กรอกข้อมูลการเงินของคุณ แล้วให้ AI ช่วยประเมินว่าจะบรรลุเป้าหมาย"
+    "กรอกข้อมูลการเงินของคุณ (หน่วยเป็นบาท) แล้วให้ AI ช่วยประเมินว่าจะบรรลุเป้าหมาย"
     "การออมเงินหรือไม่ 🔮"
 )
 
@@ -90,18 +201,36 @@ if model_path is None:
     st.stop()
 
 
+# mtime + ขนาดไฟล์เป็นส่วนหนึ่งของ cache key: กันปัญหาอัปโหลดโมเดลตัวใหม่
+# (ชื่อไฟล์ชั่วคราวเดิม) แล้วได้โมเดลเก่าจากแคช
 @st.cache_resource(show_spinner="กำลังโหลดโมเดล...")
-def load_model(path: str):
+def load_model(path: str, mtime: float, size: int):
     return joblib.load(path)
 
 
 try:
-    model = load_model(model_path)
+    model = load_model(model_path, os.path.getmtime(model_path), os.path.getsize(model_path))
 except Exception as e:
     st.error(f"โหลดโมเดลไม่สำเร็จ: {e}")
     st.stop()
 
 st.sidebar.success(f"✅ โหลดโมเดล\n'{os.path.basename(model_path)}' สำเร็จ")
+
+# ตั้งค่าขั้นสูง: อัตราแปลงบาท -> หน่วยของข้อมูลเทรน (ค่าเริ่มต้นมาจาก THB_PER_MODEL_UNIT)
+with st.sidebar.expander("🔧 ตั้งค่าขั้นสูง (สกุลเงินของข้อมูลเทรน)"):
+    thb_per_unit = st.number_input(
+        f"{CURRENCY_NAME} ต่อ 1 หน่วยเงินของข้อมูลที่ใช้ฝึกโมเดล",
+        min_value=0.01, value=float(THB_PER_MODEL_UNIT), step=0.5, format="%.2f",
+        help=(
+            "1.00 = ไม่แปลง (ข้อมูลเทรนเป็นสเกลเดียวกับบาท) | "
+            "เช่น 35.00 = ข้อมูลเทรนเป็นดอลลาร์ และ 1 ดอลลาร์ ≈ 35 บาท "
+            "ยอดเงินที่ส่งเข้าโมเดล = ยอดที่กรอก (บาท) ÷ ค่านี้"
+        ),
+    )
+    if abs(thb_per_unit - 1.0) < 1e-9:
+        st.caption("ตอนนี้: ส่งยอดเงินเข้าโมเดลตามที่กรอก (ไม่แปลง)")
+    else:
+        st.caption(f"ตอนนี้: ยอดเงิน (บาท) ÷ {thb_per_unit:,.2f} ก่อนส่งเข้าโมเดล")
 
 domain = model.domain
 
@@ -121,6 +250,9 @@ TAB_OTHER = "🗂️ อื่นๆ"
 # widget ที่จะใช้วาดฟิลด์นั้น ๆ สำหรับ feature ที่ "รู้จัก" (มาจากชุดข้อมูล
 # ตัวอย่างที่ใช้ฝึก)
 #
+# ค่าเริ่มต้น: ช่องตัวเลขทุกช่องเริ่มที่ 0 / 0.00 ส่วน dropdown ทุกช่องเริ่มที่
+# "ตัวเลือกแรก" ตามลำดับที่เรียงไว้ใน thai_options / choices
+#
 # widget ที่รองรับ:
 #   "number"  -> st.number_input (ค่าเริ่มต้น ถ้าไม่ระบุ)
 #   "slider"  -> st.slider (ต้องระบุ min/max เพิ่ม)
@@ -128,7 +260,10 @@ TAB_OTHER = "🗂️ อื่นๆ"
 #                (ใช้กับตัวแปรต่อเนื่องที่อยากให้ผู้ใช้เลือกเป็นระดับ ไม่ใช่
 #                พิมพ์ตัวเลขเอง) ต้องระบุ "choices": [(label_th, value), ...]
 #   (ไม่ระบุ widget สำหรับตัวแปรหมวดหมู่ / กลุ่ม one-hot) -> st.selectbox
-#                โดยอัตโนมัติ ใช้ "thai_options" และ "default_option"
+#                โดยอัตโนมัติ ใช้ "thai_options" (ตัวแรก = ค่าเริ่มต้น)
+#
+# "money": True = ฟิลด์ยอดเงิน (หน่วยบาท) ยอดนี้จะถูกแปลงด้วย
+#                THB_PER_MODEL_UNIT ก่อนส่งเข้าโมเดล
 #
 # *** จุดที่ต้องแก้ถ้าคอลัมน์ของคุณไม่ตรงกับตัวอย่าง ***
 # ถ้าโมเดลของคุณมีชื่อคอลัมน์ต่างไป ให้เพิ่ม/แก้ key ในดิกชันนารีนี้ให้ตรง
@@ -137,27 +272,28 @@ TAB_OTHER = "🗂️ อื่นๆ"
 # ----------------------------------------------------------------------------
 FIELD_META = {
     "monthly_income": {
-        "label": "รายได้ต่อเดือน (บาท)", "default": 25000.0, "step": 500.0,
-        "tab": TAB_INCOME_EXPENSE,
+        "label": "รายได้ต่อเดือน (บาท)", "default": 0.0, "step": 500.0,
+        "money": True, "tab": TAB_INCOME_EXPENSE,
     },
     "monthly_expense_total": {
-        "label": "รายจ่ายรวมต่อเดือน (บาท)", "default": 18000.0, "step": 500.0,
-        "tab": TAB_INCOME_EXPENSE,
+        "label": "รายจ่ายรวมต่อเดือน (บาท)", "default": 0.0, "step": 500.0,
+        "money": True, "tab": TAB_INCOME_EXPENSE,
+        "help": "รายจ่ายทั้งหมดต่อเดือน รวมค่าผ่อนหนี้ (ถ้ามี)",
     },
     "essential_spending": {
         "label": "รายจ่ายจำเป็น เช่น ค่าอาหาร ค่าน้ำค่าไฟ (บาท)",
-        "default": 12000.0, "step": 500.0, "tab": TAB_INCOME_EXPENSE,
+        "default": 0.0, "step": 500.0, "money": True, "tab": TAB_INCOME_EXPENSE,
     },
     "discretionary_spending": {
         "label": "รายจ่ายฟุ่มเฟือย เช่น ช้อปปิ้ง ท่องเที่ยว (บาท)",
-        "default": 4000.0, "step": 500.0, "tab": TAB_INCOME_EXPENSE,
+        "default": 0.0, "step": 500.0, "money": True, "tab": TAB_INCOME_EXPENSE,
     },
     "rent_or_mortgage": {
-        "label": "ค่าเช่า/ผ่อนบ้านต่อเดือน (บาท)", "default": 8000.0,
-        "step": 500.0, "tab": TAB_INCOME_EXPENSE,
+        "label": "ค่าเช่า/ผ่อนบ้านต่อเดือน (บาท)", "default": 0.0,
+        "step": 500.0, "money": True, "tab": TAB_INCOME_EXPENSE,
     },
     "subscription_services": {
-        "label": "จำนวนบริการสมาชิกรายเดือน (รายการ)", "default": 2.0,
+        "label": "จำนวนบริการสมาชิกรายเดือน (รายการ)", "default": 0.0,
         "step": 1.0, "format": "%.0f", "tab": TAB_INCOME_EXPENSE,
     },
     "income_type": {
@@ -167,7 +303,6 @@ FIELD_META = {
             "Freelance": "ฟรีแลนซ์/รับจ้าง (Freelance)",
             "Mixed": "รายได้ผสม (Mixed)",
         },
-        "default_option": "Salary",
     },
     "category": {
         "label": "หมวดหมู่การใช้จ่ายหลัก", "tab": TAB_INCOME_EXPENSE,
@@ -183,34 +318,36 @@ FIELD_META = {
             "Insurance": "ประกันภัย (Insurance)",
             "Rent": "ค่าเช่าบ้าน (Rent)",
         },
-        "default_option": "Dining Out",
     },
     "credit_score": {
-        "label": "คะแนนเครดิต (Credit Score)", "default": 650.0, "step": 10.0,
-        "format": "%.0f", "tab": TAB_DEBT_CREDIT,
-        "help": "คะแนนความน่าเชื่อถือทางการเงิน ยิ่งสูงยิ่งดี (โดยทั่วไปอยู่ช่วง 300-850)",
+        "label": "คะแนนเครดิต (Credit Score)", "default": 0.0, "step": 10.0,
+        "format": "%.0f", "min": 0.0, "max": 850.0, "tab": TAB_DEBT_CREDIT,
+        "help": (
+            "คะแนนความน่าเชื่อถือทางการเงิน ยิ่งสูงยิ่งดี "
+            f"(กรอกในช่วง {CREDIT_SCORE_MIN}-{CREDIT_SCORE_MAX})"
+        ),
     },
     "debt_to_income_ratio": {
         "label": "อัตราส่วนหนี้สินต่อรายได้ (DTI)",
-        "widget": "slider", "min": 0.0, "max": 1.0, "default": 0.35, "step": 0.01,
+        "widget": "slider", "min": 0.0, "max": 1.0, "default": 0.0, "step": 0.01,
         "format": "%.2f", "tab": TAB_DEBT_CREDIT,
         "help": (
             "DTI (Debt-to-Income Ratio) = ยอดผ่อนชำระหนี้ทั้งหมดต่อเดือน "
             "หารด้วยรายได้ต่อเดือน แสดงเป็นสัดส่วน 0.00-1.00 "
-            "(เช่น 0.35 หมายถึงหนี้กิน 35% ของรายได้)"
+            "(เช่น 0.35 หมายถึงหนี้กิน 35% ของรายได้) — ไม่มีหน่วยเงิน"
         ),
     },
     "loan_payment": {
-        "label": "ยอดผ่อนชำระหนี้ต่อเดือน (บาท)", "default": 5000.0,
-        "step": 500.0, "tab": TAB_DEBT_CREDIT,
+        "label": "ยอดผ่อนชำระหนี้ต่อเดือน (บาท)", "default": 0.0,
+        "step": 500.0, "money": True, "tab": TAB_DEBT_CREDIT,
     },
     "investment_amount": {
-        "label": "เงินลงทุนต่อเดือน (บาท)", "default": 3000.0, "step": 500.0,
-        "tab": TAB_DEBT_CREDIT,
+        "label": "เงินลงทุนต่อเดือน (บาท)", "default": 0.0, "step": 500.0,
+        "money": True, "tab": TAB_DEBT_CREDIT,
     },
     "emergency_fund": {
-        "label": "เงินสำรองฉุกเฉินที่มีอยู่ (บาท)", "default": 20000.0,
-        "step": 1000.0, "tab": TAB_DEBT_CREDIT,
+        "label": "เงินสำรองฉุกเฉินที่มีอยู่ (บาท)", "default": 0.0,
+        "step": 1000.0, "money": True, "tab": TAB_DEBT_CREDIT,
     },
     "financial_scenario": {
         "label": "สถานการณ์ทางการเงิน", "tab": TAB_STATUS_OTHER,
@@ -219,7 +356,6 @@ FIELD_META = {
             "inflation": "ภาวะเงินเฟ้อ (Inflation)",
             "recession": "ภาวะเศรษฐกิจถดถอย (Recession)",
         },
-        "default_option": "normal",
     },
     "cash_flow_status": {
         "label": "สถานะกระแสเงินสด", "tab": TAB_STATUS_OTHER,
@@ -228,12 +364,10 @@ FIELD_META = {
             "Neutral": "สมดุล/พอดี (Neutral)",
             "Negative": "เป็นลบ/ติดลบ (Negative)",
         },
-        "default_option": "Positive",
     },
     "financial_stress_level": {
         "label": "ระดับความเครียดทางการเงิน", "tab": TAB_STATUS_OTHER,
         "thai_options": {"Low": "ต่ำ (Low)", "Medium": "ปานกลาง (Medium)", "High": "สูง (High)"},
-        "default_option": "Low",
     },
     "financial_advice_score": {
         "label": "การปฏิบัติตามคำแนะนำ/วินัยทางการเงิน",
@@ -246,10 +380,13 @@ FIELD_META = {
         ],
     },
     "transaction_count": {
-        "label": "จำนวนธุรกรรมต่อเดือน (ครั้ง)", "default": 30.0, "step": 1.0,
+        "label": "จำนวนธุรกรรมต่อเดือน (ครั้ง)", "default": 0.0, "step": 1.0,
         "format": "%.0f", "tab": TAB_STATUS_OTHER,
     },
 }
+
+# ชื่อ attribute ที่เป็นยอดเงิน (บาท) — ใช้ตอนแปลงสเกลก่อนส่งเข้าโมเดล
+MONEY_NAMES = {name for name, m in FIELD_META.items() if m.get("money")}
 
 # ----------------------------------------------------------------------------
 # ฟิลด์ที่ต้องการ "ซ่อน" ไม่ให้ผู้ใช้กรอกในหน้าเว็บ แต่จะใส่ค่า default ให้
@@ -327,8 +464,19 @@ for field in fields:
 active_tabs = [t for t in TAB_ORDER + [TAB_OTHER] if fields_by_tab.get(t)]
 
 
+def field_help(meta):
+    """รวม help ของฟิลด์ + ระบุหน่วยเงินบาทให้ฟิลด์ที่เป็นยอดเงิน"""
+    parts = []
+    if meta.get("help"):
+        parts.append(meta["help"])
+    if meta.get("money"):
+        parts.append(MONEY_HELP)
+    return " | ".join(parts) if parts else None
+
+
 st.subheader("📝 กรอกข้อมูลทางการเงินของคุณ")
-user_values = {}  # key = ชื่อ attribute จริงตาม domain, value = float
+user_values = {}   # key = ชื่อ attribute จริงตาม domain, value = float (ยอดเงินเป็น "บาท" ตามที่กรอก)
+selected_raw = {}  # key = ชื่อฟิลด์, value = ค่าอังกฤษที่เลือก (ใช้ตรวจความสอดคล้อง)
 
 tabs = st.tabs(active_tabs)
 for tab_name, tab_container in zip(active_tabs, tabs):
@@ -345,14 +493,14 @@ for tab_name, tab_container in zip(active_tabs, tabs):
                     widget = meta.get("widget", "number")
 
                     if isinstance(attr, ContinuousVariable) and widget == "choice":
-                        # ----- ตัวแปรต่อเนื่อง แต่ให้ผู้ใช้เลือกเป็นระดับ -----
+                        # ----- ตัวแปรต่อเนื่อง แต่ให้ผู้ใช้เลือกเป็นระดับ (เริ่มที่ตัวเลือกแรก) -----
                         label = meta.get("label", attr.name)
                         choices = meta.get("choices", [])
                         choice_labels = [c[0] for c in choices]
                         choice_map = dict(choices)
                         selected_choice = st.selectbox(
-                            label, options=choice_labels,
-                            help=meta.get("help"),
+                            label, options=choice_labels, index=0,
+                            help=field_help(meta),
                             key=f"choice_{attr.name}",
                         )
                         user_values[attr.name] = float(choice_map[selected_choice])
@@ -367,66 +515,63 @@ for tab_name, tab_container in zip(active_tabs, tabs):
                         val = st.slider(
                             label, min_value=min_v, max_value=max_v,
                             value=default_val, step=step,
-                            help=meta.get("help"),
+                            format=meta.get("format", "%.2f"),
+                            help=field_help(meta),
                             key=f"slider_{attr.name}",
                         )
                         user_values[attr.name] = float(val)
 
                     elif isinstance(attr, ContinuousVariable):
-                        # ----- ตัวแปรต่อเนื่อง แบบช่องกรอกตัวเลขปกติ -----
+                        # ----- ตัวแปรต่อเนื่อง แบบช่องกรอกตัวเลขปกติ (เริ่มที่ 0) -----
                         label = meta.get("label", attr.name)
                         default_val = float(meta.get("default", 0.0))
                         step = float(meta.get("step", 1.0))
                         fmt = meta.get("format", "%.2f")
+                        kwargs = {"min_value": float(meta.get("min", 0.0))}
+                        if "max" in meta:
+                            kwargs["max_value"] = float(meta["max"])
                         val = st.number_input(
                             label, value=default_val, step=step, format=fmt,
-                            help=meta.get("help"),
+                            help=field_help(meta),
                             key=f"num_{attr.name}",
+                            **kwargs,
                         )
                         user_values[attr.name] = float(val)
 
                     elif isinstance(attr, DiscreteVariable):
-                        # ----- ตัวแปรหมวดหมู่ปกติ (ไม่ผ่าน Continuize) -----
+                        # ----- ตัวแปรหมวดหมู่ปกติ (ไม่ผ่าน Continuize) เริ่มที่ตัวเลือกแรก -----
                         label = meta.get("label", attr.name)
                         thai_options = meta.get("thai_options", {})
-                        options = list(attr.values)
-                        default_option = meta.get("default_option")
-                        default_idx = (
-                            options.index(default_option)
-                            if default_option in options else 0
-                        )
+                        options = ordered_options(list(attr.values), thai_options)
                         selected_label = st.selectbox(
-                            label, options=options, index=default_idx,
+                            label, options=options, index=0,
                             format_func=lambda v, m=thai_options: m.get(v, v),
-                            help=meta.get("help"),
+                            help=field_help(meta),
                             key=f"sel_{attr.name}",
                         )
                         user_values[attr.name] = float(attr.values.index(selected_label))
+                        selected_raw[attr.name] = selected_label
 
                     else:
                         st.warning(f"ไม่รองรับชนิดตัวแปร '{attr.name}' โดยอัตโนมัติ")
 
                 else:
-                    # ----- กลุ่ม one-hot: รวมกลับเป็น dropdown เดียว -----
+                    # ----- กลุ่ม one-hot: รวมกลับเป็น dropdown เดียว เริ่มที่ตัวเลือกแรก -----
                     _, prefix, items = field
                     meta = FIELD_META.get(prefix, {})
                     label = meta.get("label", prefix)
                     thai_options = meta.get("thai_options", {})
-                    value_strs = [v for v, _ in items]
-                    default_option = meta.get("default_option")
-                    default_idx = (
-                        value_strs.index(default_option)
-                        if default_option in value_strs else 0
-                    )
+                    value_strs = ordered_options([v for v, _ in items], thai_options)
                     selected_value = st.selectbox(
-                        label, options=value_strs, index=default_idx,
+                        label, options=value_strs, index=0,
                         format_func=lambda v, m=thai_options: m.get(v, v),
-                        help=meta.get("help"),
+                        help=field_help(meta),
                         key=f"onehot_{prefix}",
                     )
                     # ตั้งค่าคอลัมน์ที่เลือกเป็น 1.0 ส่วนคอลัมน์อื่นในกลุ่มเดียวกันเป็น 0.0
                     for value_str, attr in items:
                         user_values[attr.name] = 1.0 if value_str == selected_value else 0.0
+                    selected_raw[prefix] = selected_value
 
 
 # ----------------------------------------------------------------------------
@@ -449,8 +594,16 @@ for attr in hidden_attrs:
 
 
 # ----------------------------------------------------------------------------
-# สรุปข้อมูลที่กรอกก่อนกดทำนาย (ให้ผู้ใช้ตรวจทานอีกครั้ง)
+# สรุปข้อมูลที่กรอกก่อนกดทำนาย (ให้ผู้ใช้ตรวจทานอีกครั้ง) — ยอดเงินแสดงเป็น ฿
 # ----------------------------------------------------------------------------
+def format_value(attr_name, value, meta):
+    if meta.get("money"):
+        return fmt_baht(value)
+    if meta.get("format") == "%.0f":
+        return f"{value:,.0f}"
+    return f"{value:,.2f}"
+
+
 with st.expander("📋 สรุปข้อมูลที่คุณกรอก (คลิกเพื่อตรวจสอบ)"):
     summary_rows = {}
     for field in fields:
@@ -470,7 +623,7 @@ with st.expander("📋 สรุปข้อมูลที่คุณกรอ
                 thai_options = meta.get("thai_options", {})
                 summary_rows[label] = thai_options.get(raw_val, raw_val)
             else:
-                summary_rows[label] = f"{user_values[attr.name]:,.2f}"
+                summary_rows[label] = format_value(attr.name, user_values[attr.name], meta)
         else:
             # กลุ่ม one-hot: หาว่าค่าไหนถูกเลือกอยู่ (เท่ากับ 1.0) แล้วแสดง
             # เป็นค่าเดียวเหมือนตอนกรอก ไม่แสดงแยกทีละคอลัมน์
@@ -496,8 +649,18 @@ predict_clicked = st.button(
 )
 
 if predict_clicked:
+    # ----- 1) ตรวจความสอดคล้องของข้อมูลก่อนส่งเข้าโมเดล -----
+    errors, warns = validate_inputs(user_values, selected_raw)
+    if errors:
+        for msg in errors:
+            st.error("❗ " + msg)
+        st.stop()
+    for msg in warns:
+        st.warning("⚠️ " + msg)
+
     try:
-        row = [user_values[attr.name] for attr in domain.attributes]
+        # ----- 2) สร้างแถวข้อมูลตามลำดับ domain (ยอดเงินบาท -> สเกลข้อมูลเทรน) -----
+        row = build_model_row(domain.attributes, user_values, MONEY_NAMES, thb_per_unit)
         X = np.array([row], dtype=float)
 
         # ใส่คอลัมน์คลาส (Y) เป็น NaN เพราะยังไม่รู้คำตอบจริงตอนทำนาย
@@ -558,12 +721,43 @@ if predict_clicked:
         with col_b:
             st.progress(min(max(confidence / 100, 0.0), 1.0))
 
+        # ----- 3) ตัวเลขคำนวณจากข้อมูลที่กรอก (หน่วยบาท) -----
+        income = user_values.get("monthly_income")
+        expense = user_values.get("monthly_expense_total")
+        loan = user_values.get("loan_payment")
+        emergency = user_values.get("emergency_fund")
+        calc_items = []
+        if income is not None and expense is not None:
+            calc_items.append((
+                f"เงินเหลือต่อเดือน (รายได้ − รายจ่ายรวม)",
+                fmt_baht(income - expense),
+            ))
+        if income is not None and income > 0 and loan is not None:
+            calc_items.append(("DTI จากยอดผ่อน ÷ รายได้", f"{loan / income:.2f}"))
+        if expense is not None and expense > 0 and emergency is not None:
+            calc_items.append(("เงินสำรองฉุกเฉินเทียบรายจ่าย", f"{emergency / expense:.1f} เดือน"))
+        if calc_items:
+            st.markdown(f"#### 🧮 ตัวเลขที่คำนวณจากข้อมูลของคุณ (หน่วย: {CURRENCY_NAME} {CURRENCY_SYMBOL})")
+            metric_cols = st.columns(len(calc_items))
+            for mc, (mlabel, mvalue) in zip(metric_cols, calc_items):
+                mc.metric(mlabel, mvalue)
+
         # ตารางความน่าจะเป็นของทุกคลาส
         with st.expander("ดูความน่าจะเป็น (Probability) ของแต่ละคลาส"):
             for i, val in enumerate(class_var.values):
                 p = float(probs[0][i]) * 100
                 st.write(f"คลาส `{val}`: {p:.2f}%")
                 st.progress(min(max(p / 100, 0.0), 1.0))
+
+        # ค่าที่ส่งเข้าโมเดลจริง (หลังแปลงสเกลสกุลเงิน) ไว้ตรวจสอบความสอดคล้อง
+        with st.expander("🔍 ค่าที่ส่งเข้าโมเดลจริง (สำหรับตรวจสอบ)"):
+            if abs(thb_per_unit - 1.0) < 1e-9:
+                st.caption("ยอดเงินส่งเข้าโมเดลตามที่กรอก (บาท) โดยไม่แปลงสเกล")
+            else:
+                st.caption(
+                    f"ยอดเงินถูกแปลงเป็นหน่วยของข้อมูลเทรน: ยอดที่กรอก (บาท) ÷ {thb_per_unit:,.2f}"
+                )
+            st.json({a.name: round(v, 6) for a, v in zip(domain.attributes, row)})
 
     except Exception as e:
         st.error(f"เกิดข้อผิดพลาดระหว่างทำนายผล: {e}")
